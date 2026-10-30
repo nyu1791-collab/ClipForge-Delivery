@@ -1,8 +1,10 @@
 """Local, single-user delivery workspace for ClipForge productions."""
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 import secrets
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -41,6 +43,10 @@ def create_app(test_config=None):
     app.secret_key = secret.read_text(encoding='ascii')
     app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Strict')
     database = data / 'delivery.sqlite3'
+
+    @app.template_filter('localtime')
+    def localtime(value):
+        return datetime.fromtimestamp(value).strftime('%Y-%m-%d %H:%M')
 
     def connect():
         db = sqlite3.connect(database, timeout=15)
@@ -216,6 +222,44 @@ def create_app(test_config=None):
             flash('保存済みRunへの再接続を開始しました。新規制作は投入しません。')
         except OSError:
             flash('再接続の起動に失敗しました。')
+        return redirect(url_for('detail', pid=pid))
+
+    @app.post('/projects/<pid>/import')
+    def import_clip(pid):
+        project(pid)
+        mode = request.form.get('mode', '')
+        if mode not in ('long', 'tiktok', 'tiktok-capcut'):
+            abort(400)
+        raw_source = request.form.get('clip_dir', '').strip()
+        if not raw_source:
+            flash('動画フォルダを指定してください。')
+            return redirect(url_for('detail', pid=pid))
+        source = Path(raw_source).expanduser()
+        if not source.is_dir() or source.is_symlink():
+            flash('動画フォルダを確認してください。')
+            return redirect(url_for('detail', pid=pid))
+        files = [source / name for name in ('video.mp4', 'captions.srt', 'captions.ass', 'render.json')]
+        if not files[0].is_file() or files[0].is_symlink() or any(p.is_symlink() for p in files):
+            flash('video.mp4が見つからないか、リンクが含まれています。')
+            return redirect(url_for('detail', pid=pid))
+        root = data / 'productions' / pid / mode / 'clips' / 'clips'
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        target = root / ('clip-import-' + uuid.uuid4().hex[:12])
+        target.mkdir(mode=0o700)
+        try:
+            for file in files:
+                if file.is_file():
+                    shutil.copyfile(file, target / file.name)
+            if not (target / 'render.json').exists():
+                title = request.form.get('clip_title', '').strip()[:200] or source.name
+                (target / 'render.json').write_text(json.dumps({'selection': {'title': title}}, ensure_ascii=False), encoding='utf-8')
+        except OSError:
+            shutil.rmtree(target)
+            flash('動画を取り込めませんでした。')
+            return redirect(url_for('detail', pid=pid))
+        with connect() as db:
+            event(db, pid, '既存の完成動画をコピー')
+        flash('既存動画を案件へコピーしました。元ファイルはそのままです。')
         return redirect(url_for('detail', pid=pid))
 
     @app.get('/projects/<pid>/download')

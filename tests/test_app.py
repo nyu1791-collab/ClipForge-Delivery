@@ -78,3 +78,18 @@ def test_start_does_not_repeat_dispatch(client, tmp_path, monkeypatch):
     assert len(calls) == 1
     assert '--mode' in calls[0][0] and 'both' in calls[0][0]
     assert not calls[0][1].get('shell', False)
+
+
+def test_import_existing_clip_preserves_source(client, tmp_path):
+    response = create(client)
+    pid = response.location.rsplit('/', 1)[-1]
+    original = tmp_path / 'original'
+    original.mkdir()
+    (original / 'video.mp4').write_bytes(b'original')
+    (original / 'captions.srt').write_text('subtitle', encoding='utf-8')
+    client.post(f'/projects/{pid}/import', data={'csrf': token(client), 'clip_dir': str(original),
+                                                 'mode': 'long', 'clip_title': '完成動画'})
+    assert (original / 'video.mp4').read_bytes() == b'original'
+    with zipfile.ZipFile(io.BytesIO(client.get(f'/projects/{pid}/download').data)) as bundle:
+        assert any(name.endswith('video.mp4') for name in bundle.namelist())
+        assert json.loads(bundle.read('titles.json'))['clips'][0]['title'] == '完成動画'

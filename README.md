@@ -32,3 +32,5 @@ $env:CLIPFORGE_DIR = (Resolve-Path ..\ClipForge).Path
 - [ClipForge](https://github.com/nyu1791-collab/ClipForge): 保存済みproduction-stateを使う再接続と、素材・字幕を非公開に保存する既存の方式。
 
 上記から設計の考え方を参考にし、このリポジトリのコードは独自に実装しています。
+
+別の場所に保存済みのClipForge完成クリップは、案件画面の「完成動画を取り込む」で `video.mp4` を含むフォルダを指定し、字幕やタイトル記録と一緒にコピーできます。元のファイルは変更しません。
