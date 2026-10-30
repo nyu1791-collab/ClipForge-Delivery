@@ -2,6 +2,9 @@ import io
 import json
 from pathlib import Path
 import re
+import subprocess
+import sys
+import time
 import zipfile
 
 import pytest
@@ -117,3 +120,65 @@ def test_clip_preview_subtitle_and_title_edit(client, tmp_path):
     assert json.loads((clip / 'render.json').read_text())['selection']['title'] == '元のタイトル'
     client.post(f'/projects/{pid}/clip-title', data={'csrf': token(client), 'relative': '../other', 'title': '不正'})
     assert client.get(f'/projects/{pid}/files/../other/video.mp4').status_code == 404
+
+
+def test_project_management_search_and_expenses(client):
+    response = create(client)
+    pid = response.location.rsplit('/', 1)[-1]
+    csrf = token(client)
+    client.post(f'/projects/{pid}/edit', data={'csrf': csrf, 'creator': 'クリエイターA', 'title': '編集後', 'due_date': '2027-01-02', 'note': '依頼メモ'})
+    assert '編集後' in client.get('/?q=クリエイターA').get_data(as_text=True)
+    assert '編集後' not in client.get('/?q=別の人').get_data(as_text=True)
+    for description, amount, currency in [('API', '1.25', 'USD'), ('制作', '2.50', 'USD'), ('素材', '100', 'JPY')]:
+        client.post(f'/projects/{pid}/expenses', data={'csrf': csrf, 'description': description, 'amount': amount, 'currency': currency})
+    client.post(f'/projects/{pid}/expenses', data={'csrf': csrf, 'description': '不正', 'amount': '1e-999999999', 'currency': 'USD'})
+    page = client.get(response.location).get_data(as_text=True)
+    assert 'USD 3.75' in page and 'JPY 100' in page and '依頼メモ' in page
+    assert '1e-999999999' not in page
+    client.post(f'/projects/{pid}/expenses/1/delete', data={'csrf': csrf})
+    assert 'USD 2.50' in client.get(response.location).get_data(as_text=True)
+
+
+def test_selected_delivery_and_subtitle_edits(client, tmp_path):
+    response = create(client)
+    pid = response.location.rsplit('/', 1)[-1]
+    base = tmp_path / 'data' / 'productions' / pid / 'long' / 'clips' / 'clips'
+    for clip_id in ('clip-001', 'clip-002'):
+        clip = base / clip_id
+        clip.mkdir(parents=True)
+        (clip / 'video.mp4').write_bytes(clip_id.encode())
+        (clip / 'captions.srt').write_text('元の字幕', encoding='utf-8')
+    relative = 'long/clips/clips/clip-001'
+    csrf = token(client)
+    client.post(f'/projects/{pid}/subtitle', data={'csrf': csrf, 'relative': relative, 'content': '編集した字幕'})
+    client.post(f'/projects/{pid}/clip-note', data={'csrf': csrf, 'relative': relative, 'status': 'ready', 'note': '納品待ち'})
+    assert '納品待ち' in client.get(response.location).get_data(as_text=True)
+    edited = client.get(f'/projects/{pid}/files/{relative}/captions-edited.srt')
+    assert edited.data.decode() == '編集した字幕'
+    response = client.post(f'/projects/{pid}/download', data={'csrf': csrf, 'clip': relative})
+    with zipfile.ZipFile(io.BytesIO(response.data)) as bundle:
+        assert all('clip-002' not in n for n in bundle.namelist())
+        assert bundle.read(relative + '/captions.srt').decode() == '元の字幕'
+        assert bundle.read(relative + '/captions-edited.srt').decode() == '編集した字幕'
+        assert bundle.getinfo(relative + '/video.mp4').compress_type == zipfile.ZIP_STORED
+    assert (base / 'clip-001' / 'captions.srt').read_text() == '元の字幕'
+
+
+def test_controller_prevents_concurrent_reconnect(tmp_path):
+    controller = Path(__file__).resolve().parents[1] / 'controller.py'
+    command = [sys.executable, str(controller), '--project-dir', str(tmp_path), '--action', 'resume', '--', sys.executable, '-c', 'import time; time.sleep(1)']
+    first = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        deadline = time.monotonic() + 5
+        while not (tmp_path / 'controller-status.json').exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert (tmp_path / 'controller-status.json').exists()
+        second = subprocess.run(command, capture_output=True, timeout=5)
+        assert second.returncode == 2
+        assert first.wait(timeout=5) == 0
+        status = json.loads((tmp_path / 'controller-status.json').read_text())
+        assert status['status'] == 'finished' and status['exit_code'] == 0
+    finally:
+        if first.poll() is None:
+            first.kill()
+            first.wait()

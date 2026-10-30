@@ -1,7 +1,9 @@
 """Local, single-user delivery workspace for ClipForge productions."""
 import json
+import io
 import os
-from datetime import datetime
+from datetime import datetime, date
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 import secrets
 import shutil
@@ -66,6 +68,14 @@ def create_app(test_config=None):
           event TEXT NOT NULL, created_at REAL NOT NULL);
           CREATE TABLE IF NOT EXISTS clip_titles (project_id TEXT NOT NULL,
           relative TEXT NOT NULL, title TEXT NOT NULL,
+          PRIMARY KEY (project_id, relative));
+          CREATE TABLE IF NOT EXISTS expenses (id INTEGER PRIMARY KEY, project_id TEXT NOT NULL,
+          description TEXT NOT NULL, amount TEXT NOT NULL, currency TEXT NOT NULL, created_at REAL NOT NULL);
+          CREATE TABLE IF NOT EXISTS clip_notes (project_id TEXT NOT NULL, relative TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending', note TEXT NOT NULL DEFAULT '',
+          PRIMARY KEY (project_id, relative));
+          CREATE TABLE IF NOT EXISTS subtitle_edits (project_id TEXT NOT NULL, relative TEXT NOT NULL,
+          content TEXT NOT NULL,
           PRIMARY KEY (project_id, relative));''')
 
     def project(pid):
@@ -84,8 +94,10 @@ def create_app(test_config=None):
         found = assets(data / 'productions' / pid)
         with connect() as db:
             titles = dict(db.execute('SELECT relative,title FROM clip_titles WHERE project_id=?', (pid,)).fetchall())
+            notes = {r['relative']: dict(r) for r in db.execute('SELECT relative,status,note FROM clip_notes WHERE project_id=?', (pid,))}
         for item in found:
             item['title'] = titles.get(item['relative'], item['title'])
+            item.update(notes.get(item['relative'], {'status': 'pending', 'note': ''}))
         return found
 
     @app.before_request
@@ -109,9 +121,15 @@ def create_app(test_config=None):
 
     @app.get('/')
     def index():
+        query = request.args.get('q', '').strip()[:200]
+        delivery = request.args.get('delivery', '')
         with connect() as db:
             rows = [dict(r) for r in db.execute('SELECT * FROM projects ORDER BY updated_at DESC')]
-        return render_template('index.html', projects=rows)
+        if query:
+            rows = [r for r in rows if query.casefold() in (r['creator'] + ' ' + r['title']).casefold()]
+        if delivery in DELIVERY:
+            rows = [r for r in rows if r['delivery'] == delivery]
+        return render_template('index.html', projects=rows, query=query, selected_delivery=delivery)
 
     @app.post('/projects')
     def create():
@@ -149,12 +167,102 @@ def create_app(test_config=None):
             if state.is_file() and not state.is_symlink():
                 try:
                     obj = json.loads(state.read_text(encoding='utf-8'))
-                    states.append({'name': name, 'status': obj.get('status', '不明'), 'run_id': obj.get('render_run_id') or next((s.get('run_id') for s in obj.get('stages', []) if s.get('run_id')), None), 'request_id': obj.get('render_request_id')})
-                except (ValueError, OSError, TypeError):
+                    stages = obj.get('stages') or []
+                    run_id = obj.get('render_run_id') or next((s.get('run_id') for s in stages if isinstance(s, dict) and s.get('run_id')), None)
+                    repo = obj.get('repository', '')
+                    run_url = f'https://github.com/{repo}/actions/runs/{run_id}' if repo in ('nyu1791-collab/ClipForge', 'nyu1791-collab/ai-model-workers') and str(run_id).isdigit() else None
+                    states.append({'name': name, 'status': obj.get('status', '不明'), 'run_id': run_id, 'run_url': run_url,
+                                   'stages': [s for s in stages if isinstance(s, dict)], 'elapsed': obj.get('elapsed_sec')})
+                except (ValueError, OSError, TypeError, AttributeError):
                     states.append({'name': name, 'status': '記録を読み取れません'})
         with connect() as db:
             history = [dict(r) for r in db.execute('SELECT event,created_at FROM history WHERE project_id=? ORDER BY id DESC LIMIT 20', (pid,))]
-        return render_template('detail.html', p=row, states=states, files=project_assets(pid), history=history)
+            expenses = [dict(r) for r in db.execute('SELECT * FROM expenses WHERE project_id=? ORDER BY id DESC', (pid,))]
+        controller_status = None
+        try:
+            status_path = base / 'controller-status.json'
+            if status_path.is_file() and not status_path.is_symlink():
+                controller_status = json.loads(status_path.read_text(encoding='utf-8'))
+                if not isinstance(controller_status, dict):
+                    controller_status = None
+        except (OSError, ValueError):
+            pass
+        totals = {}
+        for expense in expenses:
+            totals[expense['currency']] = totals.get(expense['currency'], Decimal('0')) + Decimal(expense['amount'])
+        files = project_assets(pid)
+        with connect() as db:
+            edits = dict(db.execute('SELECT relative,content FROM subtitle_edits WHERE project_id=?', (pid,)).fetchall())
+        for item in files:
+            item['subtitle_editor'] = None
+            item['subtitle_edited'] = item['relative'] in edits
+            path = base / item['relative'] / 'captions.srt'
+            try:
+                if 'captions.srt' in item['subtitles'] and path.stat().st_size <= 512 * 1024:
+                    item['subtitle_editor'] = edits[item['relative']] if item['subtitle_edited'] else path.read_text(encoding='utf-8-sig')
+            except (OSError, UnicodeError):
+                pass
+        return render_template('detail.html', p=row, states=states, files=files, history=history, expenses=expenses, totals=totals, controller_status=controller_status)
+
+    @app.post('/projects/<pid>/edit')
+    def edit_project(pid):
+        project(pid)
+        creator, title, due, note = (request.form.get(k, '').strip() for k in ('creator', 'title', 'due_date', 'note'))
+        try:
+            if due:
+                date.fromisoformat(due)
+            valid = bool(creator and title) and len(creator) <= 100 and len(title) <= 200 and len(note) <= 2000
+        except ValueError:
+            valid = False
+        if not valid:
+            flash('配信者名・案件名・納期・メモを確認してください。')
+            return redirect(url_for('detail', pid=pid))
+        with connect() as db:
+            db.execute('UPDATE projects SET creator=?,title=?,due_date=?,note=?,updated_at=? WHERE id=?', (creator, title, due, note, time.time(), pid))
+            event(db, pid, '案件情報を更新')
+        flash('案件情報を保存しました。')
+        return redirect(url_for('detail', pid=pid))
+
+    @app.post('/projects/<pid>/expenses')
+    def add_expense(pid):
+        project(pid)
+        description = request.form.get('description', '').strip()
+        amount = request.form.get('amount', '').strip()
+        currency = request.form.get('currency', '').strip().upper()
+        try:
+            number = Decimal(amount)
+            valid = (number.is_finite() and 0 <= number <= Decimal('1000000000000')
+                     and len(amount) <= 30 and -8 <= number.as_tuple().exponent <= 12)
+        except InvalidOperation:
+            valid = False
+        if not valid or not description or len(description) > 100 or not currency.isascii() or not currency.isalpha() or not 3 <= len(currency) <= 8:
+            flash('費用の内容・金額・通貨を確認してください。')
+            return redirect(url_for('detail', pid=pid))
+        with connect() as db:
+            db.execute('INSERT INTO expenses(project_id,description,amount,currency,created_at) VALUES (?,?,?,?,?)', (pid, description, format(number, 'f'), currency, time.time()))
+            event(db, pid, '費用を記録: ' + description)
+        flash('費用を記録しました。請求額の自動取得ではありません。')
+        return redirect(url_for('detail', pid=pid))
+
+    @app.post('/projects/<pid>/expenses/<int:expense_id>/delete')
+    def delete_expense(pid, expense_id):
+        project(pid)
+        with connect() as db:
+            if db.execute('DELETE FROM expenses WHERE id=? AND project_id=?', (expense_id, pid)).rowcount:
+                event(db, pid, '費用の記録を削除')
+        return redirect(url_for('detail', pid=pid))
+
+    @app.post('/projects/<pid>/clip-note')
+    def clip_note(pid):
+        project(pid)
+        relative, status, note = (request.form.get(k, '').strip() for k in ('relative', 'status', 'note'))
+        if relative not in {f['relative'] for f in project_assets(pid)} or status not in DELIVERY or len(note) > 1000:
+            abort(400)
+        with connect() as db:
+            db.execute('INSERT INTO clip_notes(project_id,relative,status,note) VALUES (?,?,?,?) ON CONFLICT(project_id,relative) DO UPDATE SET status=excluded.status,note=excluded.note', (pid, relative, status, note))
+            event(db, pid, '動画の納品メモを更新')
+        flash('動画の納品状況とメモを保存しました。')
+        return redirect(url_for('detail', pid=pid))
 
     @app.post('/projects/<pid>/clip-title')
     def clip_title(pid):
@@ -170,11 +278,31 @@ def create_app(test_config=None):
         flash('タイトルを保存しました。ZIPのタイトル一覧にも反映されます。')
         return redirect(url_for('detail', pid=pid))
 
+    @app.post('/projects/<pid>/subtitle')
+    def save_subtitle(pid):
+        project(pid)
+        relative = request.form.get('relative', '')
+        content = request.form.get('content', '')
+        item = next((f for f in project_assets(pid) if f['relative'] == relative), None)
+        if item is None or 'captions.srt' not in item['subtitles'] or len(content.encode('utf-8')) > 512 * 1024:
+            abort(400)
+        with connect() as db:
+            db.execute('INSERT INTO subtitle_edits(project_id,relative,content) VALUES (?,?,?) ON CONFLICT(project_id,relative) DO UPDATE SET content=excluded.content', (pid, relative, content))
+            event(db, pid, '字幕の編集版を保存')
+        flash('字幕の編集版を保存しました。元字幕と動画は変更していません。')
+        return redirect(url_for('detail', pid=pid))
+
     @app.get('/projects/<pid>/files/<path:relative>/<name>')
     def clip_file(pid, relative, name):
         project(pid)
-        if name not in ('video.mp4', 'captions.srt', 'captions.ass') or relative not in {f['relative'] for f in project_assets(pid)}:
+        if name not in ('video.mp4', 'captions.srt', 'captions.ass', 'captions-edited.srt') or relative not in {f['relative'] for f in project_assets(pid)}:
             abort(404)
+        if name == 'captions-edited.srt':
+            with connect() as db:
+                row = db.execute('SELECT content FROM subtitle_edits WHERE project_id=? AND relative=?', (pid, relative)).fetchone()
+            if row is None:
+                abort(404)
+            return send_file(io.BytesIO(row['content'].encode('utf-8')), mimetype='application/x-subrip', as_attachment=True, download_name=name)
         base = data / 'productions' / pid
         path = base / relative / name
         if not path.is_file() or path.is_symlink() or not path.resolve().is_relative_to(base.resolve()):
@@ -193,7 +321,7 @@ def create_app(test_config=None):
         base = data / 'productions' / pid
         base.mkdir(parents=True, exist_ok=True, mode=0o700)
         with connect() as db:
-            changed = db.execute("UPDATE projects SET status='starting',updated_at=? WHERE id=? AND status='draft'", (time.time(), pid)).rowcount
+            changed = db.execute("UPDATE projects SET status='starting',updated_at=? WHERE id=? AND status IN ('draft','start_failed')", (time.time(), pid)).rowcount
             if not changed:
                 flash('この案件は既に開始済みです。重複投入はしません。')
                 return redirect(url_for('detail', pid=pid))
@@ -205,7 +333,7 @@ def create_app(test_config=None):
                     kwargs['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP
                 else:
                     kwargs['start_new_session'] = True
-                subprocess.Popen([str(python), str(script), row['source_url'], '--mode', row['mode'], '--output', str(base), '--clips', str(row['clips'])], **kwargs)
+                subprocess.Popen([sys.executable, str(ROOT / 'controller.py'), '--project-dir', str(base), '--action', 'start', '--', str(python), str(script), row['source_url'], '--mode', row['mode'], '--output', str(base), '--clips', str(row['clips'])], **kwargs)
             with connect() as db:
                 db.execute("UPDATE projects SET status='started',updated_at=? WHERE id=?", (time.time(), pid))
                 event(db, pid, '制作コントローラー起動')
@@ -252,10 +380,10 @@ def create_app(test_config=None):
                 kwargs = {'cwd': str(clipforge), 'stdin': subprocess.DEVNULL, 'stdout': log, 'stderr': subprocess.STDOUT}
                 if os.name == 'nt': kwargs['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP
                 else: kwargs['start_new_session'] = True
-                subprocess.Popen([str(python), str(script), '--resume', '--output', str(output)], **kwargs)
+                subprocess.Popen([sys.executable, str(ROOT / 'controller.py'), '--project-dir', str(base), '--action', 'resume', '--', str(python), str(script), '--resume', '--output', str(output)], **kwargs)
             with connect() as db:
                 event(db, pid, mode + ' の保存済みRunに再接続')
-            flash('保存済みRunへの再接続を開始しました。新規制作は投入しません。')
+            flash('保存済みRunへの再接続を指示しました。処理中のコントローラーがある場合、重複起動は行いません。')
         except OSError:
             flash('再接続の起動に失敗しました。')
         return redirect(url_for('detail', pid=pid))
@@ -298,22 +426,30 @@ def create_app(test_config=None):
         flash('既存動画を案件へコピーしました。元ファイルはそのままです。')
         return redirect(url_for('detail', pid=pid))
 
-    @app.get('/projects/<pid>/download')
+    @app.route('/projects/<pid>/download', methods=['GET', 'POST'])
     def download(pid):
         row = project(pid)
         base = data / 'productions' / pid
         files = project_assets(pid)
+        if request.method == 'POST':
+            selected = set(request.form.getlist('clip'))
+            files = [item for item in files if item['relative'] in selected]
         if not files:
-            flash('回収済みの動画・字幕がまだありません。')
+            flash('納品する動画を選択してください。')
             return redirect(url_for('detail', pid=pid))
         tmp = tempfile.SpooledTemporaryFile(max_size=16 * 1024 * 1024, mode='w+b')
+        with connect() as db:
+            edits = dict(db.execute('SELECT relative,content FROM subtitle_edits WHERE project_id=?', (pid,)).fetchall())
         with zipfile.ZipFile(tmp, 'w', compression=zipfile.ZIP_DEFLATED, allowZip64=True) as bundle:
             for item in files:
                 folder = base / item['relative']
                 for name in ('video.mp4', 'captions.srt', 'captions.ass'):
                     path = folder / name
                     if path.is_file() and not path.is_symlink() and path.resolve().is_relative_to(base.resolve()):
-                        bundle.write(path, item['relative'] + '/' + name)
+                        bundle.write(path, item['relative'] + '/' + name,
+                                     compress_type=zipfile.ZIP_STORED if name == 'video.mp4' else zipfile.ZIP_DEFLATED)
+                if item['relative'] in edits:
+                    bundle.writestr(item['relative'] + '/captions-edited.srt', edits[item['relative']])
             bundle.writestr('titles.json', json.dumps({'project': row['title'], 'clips': [{'file': i['relative'], 'title': i['title']} for i in files]}, ensure_ascii=False, indent=2))
         tmp.seek(0)
         return send_file(tmp, mimetype='application/zip', as_attachment=True, download_name='clipforge-delivery-' + pid[:8] + '.zip')
@@ -342,13 +478,13 @@ def assets(base):
             if not folder.is_dir() or folder.is_symlink() or not folder.resolve().is_relative_to(base.resolve()):
                 continue
             receipt = folder / 'render.json'
-            if not receipt.is_file() or receipt.is_symlink():
-                continue
+            title = folder.name
             try:
-                record = json.loads(receipt.read_text(encoding='utf-8'))
-                title = str((record.get('selection') or {}).get('title', folder.name))[:500]
+                if receipt.is_file() and not receipt.is_symlink():
+                    record = json.loads(receipt.read_text(encoding='utf-8'))
+                    title = str((record.get('selection') or {}).get('title', folder.name))[:500]
             except (OSError, ValueError, TypeError, AttributeError):
-                continue
+                pass
             if (folder / 'video.mp4').is_file() and not (folder / 'video.mp4').is_symlink():
                 subtitles = [name for name in ('captions.srt', 'captions.ass')
                              if (folder / name).is_file() and not (folder / name).is_symlink()]
