@@ -28,6 +28,7 @@ def create_app(test_config=None):
     app = Flask(__name__)
     app.config.update(DATA_DIR=os.environ.get('CLIPFORGE_DELIVERY_DATA', str(DEFAULT_DATA)),
                       CLIPFORGE_DIR=os.environ.get('CLIPFORGE_DIR', str(ROOT.parent / 'ClipForge')),
+                      CLIPFORGE_PYTHON=os.environ.get('CLIPFORGE_PYTHON', ''),
                       MAX_CONTENT_LENGTH=1024 * 1024)
     if test_config:
         app.config.update(test_config)
@@ -309,12 +310,28 @@ def create_app(test_config=None):
             abort(404)
         return send_file(path, as_attachment=name != 'video.mp4', conditional=True)
 
+    def production_tools(name):
+        root = Path(app.config['CLIPFORGE_DIR']).expanduser().resolve()
+        configured = app.config['CLIPFORGE_PYTHON']
+        python = Path(configured).expanduser().resolve() if configured else root / '.venv' / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
+        return root, root / 'tools' / name, python
+
+    def launch(base, action, command):
+        with (base / 'controller.log').open('ab') as log:
+            kwargs = {'cwd': str(Path(app.config['CLIPFORGE_DIR']).expanduser().resolve()),
+                      'stdin': subprocess.DEVNULL, 'stdout': log, 'stderr': subprocess.STDOUT,
+                      'env': {**os.environ, 'PYTHONUTF8': '1'}}
+            if os.name == 'nt':
+                kwargs['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                kwargs['start_new_session'] = True
+            subprocess.Popen([sys.executable, str(ROOT / 'controller.py'), '--project-dir', str(base),
+                              '--action', action, '--', *map(str, command)], **kwargs)
+
     @app.post('/projects/<pid>/start')
     def start(pid):
         row = project(pid)
-        clipforge = Path(app.config['CLIPFORGE_DIR']).expanduser().resolve()
-        script = clipforge / 'tools' / 'produce_formats.py'
-        python = clipforge / '.venv' / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
+        clipforge, script, python = production_tools('produce_formats.py')
         if not script.is_file() or not python.is_file() or not shutil_which('gh'):
             flash('ClipForge、仮想環境、またはGitHub CLIが見つかりません。設定手順を確認してください。')
             return redirect(url_for('detail', pid=pid))
@@ -327,13 +344,7 @@ def create_app(test_config=None):
                 return redirect(url_for('detail', pid=pid))
             event(db, pid, '制作開始を指示')
         try:
-            with (base / 'controller.log').open('ab') as log:
-                kwargs = {'cwd': str(clipforge), 'stdin': subprocess.DEVNULL, 'stdout': log, 'stderr': subprocess.STDOUT}
-                if os.name == 'nt':
-                    kwargs['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP
-                else:
-                    kwargs['start_new_session'] = True
-                subprocess.Popen([sys.executable, str(ROOT / 'controller.py'), '--project-dir', str(base), '--action', 'start', '--', str(python), str(script), row['source_url'], '--mode', row['mode'], '--output', str(base), '--clips', str(row['clips'])], **kwargs)
+            launch(base, 'start', [python, script, row['source_url'], '--mode', row['mode'], '--output', base, '--clips', row['clips']])
             with connect() as db:
                 db.execute("UPDATE projects SET status='started',updated_at=? WHERE id=?", (time.time(), pid))
                 event(db, pid, '制作コントローラー起動')
@@ -369,18 +380,12 @@ def create_app(test_config=None):
         base = data / 'productions' / pid
         output = base / mode
         state = output / 'production-state.json'
-        clipforge = Path(app.config['CLIPFORGE_DIR']).expanduser().resolve()
-        script = clipforge / 'tools' / 'produce_with_gemini.py'
-        python = clipforge / '.venv' / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
+        clipforge, script, python = production_tools('produce_with_gemini.py')
         if not state.is_file() or state.is_symlink() or not output.resolve().is_relative_to(base.resolve()) or not script.is_file() or not python.is_file():
             flash('再接続に必要な保存済み状態またはClipForgeが見つかりません。')
             return redirect(url_for('detail', pid=pid))
         try:
-            with (base / 'controller.log').open('ab') as log:
-                kwargs = {'cwd': str(clipforge), 'stdin': subprocess.DEVNULL, 'stdout': log, 'stderr': subprocess.STDOUT}
-                if os.name == 'nt': kwargs['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP
-                else: kwargs['start_new_session'] = True
-                subprocess.Popen([sys.executable, str(ROOT / 'controller.py'), '--project-dir', str(base), '--action', 'resume', '--', str(python), str(script), '--resume', '--output', str(output)], **kwargs)
+            launch(base, 'resume', [python, script, '--resume', '--output', output])
             with connect() as db:
                 event(db, pid, mode + ' の保存済みRunに再接続')
             flash('保存済みRunへの再接続を指示しました。処理中のコントローラーがある場合、重複起動は行いません。')
