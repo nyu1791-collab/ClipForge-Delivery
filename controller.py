@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sqlite3
 import sys
 import time
 
@@ -29,6 +30,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--project-dir', required=True, type=Path)
     parser.add_argument('--action', required=True, choices=['start', 'resume'])
+    parser.add_argument('--database', type=Path)
     parser.add_argument('command', nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command
@@ -64,6 +66,30 @@ def main():
             return 1
         finally:
             save()
+            if args.database:
+                try:
+                    with sqlite3.connect(args.database, timeout=15) as db:
+                        pid = args.project_dir.name
+                        row = db.execute('SELECT mode FROM projects WHERE id=?', (pid,)).fetchone()
+                        if row:
+                            modes = ('long', 'tiktok') if row[0] == 'both' else (row[0],)
+                            states = []
+                            for mode in modes:
+                                path = args.project_dir / mode / 'production-state.json'
+                                try:
+                                    saved = json.loads(path.read_text(encoding='utf-8')) if path.is_file() else {}
+                                except (OSError, ValueError):
+                                    saved = {}
+                                states.append(saved if isinstance(saved, dict) else {})
+                            completed = all(s.get('status') == 'complete' for s in states)
+                            project_status = 'completed' if completed else 'incomplete'
+                            if status['status'] == 'failed_to_start' and args.action == 'start':
+                                project_status = 'start_failed'
+                            db.execute('UPDATE projects SET status=?,updated_at=? WHERE id=?', (project_status,time.time(),pid))
+                            db.execute('INSERT INTO history(project_id,event,created_at) VALUES (?,?,?)',
+                                       (pid, '制作処理終了: ' + project_status, time.time()))
+                except (sqlite3.Error, OSError, ValueError, AttributeError) as error:
+                    print(f'案件状態の保存に失敗: {error}', file=sys.stderr, flush=True)
 
 
 if __name__ == '__main__':

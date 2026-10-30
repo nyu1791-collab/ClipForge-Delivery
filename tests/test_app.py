@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import re
 import subprocess
+import sqlite3
 import sys
 import time
 import zipfile
@@ -182,3 +183,24 @@ def test_controller_prevents_concurrent_reconnect(tmp_path):
         if first.poll() is None:
             first.kill()
             first.wait()
+
+
+def test_controller_updates_whole_project_after_one_format_finishes(client, tmp_path):
+    response = create(client)
+    pid = response.location.rsplit('/', 1)[-1]
+    base = tmp_path / 'data' / 'productions' / pid
+    for mode, status in [('long', 'complete'), ('tiktok', 'failed_or_unknown')]:
+        folder = base / mode
+        folder.mkdir(parents=True)
+        (folder/'production-state.json').write_text(json.dumps({'status':status}))
+    dbpath = tmp_path / 'data' / 'delivery.sqlite3'
+    controller = Path(__file__).resolve().parents[1] / 'controller.py'
+    command = [sys.executable, str(controller), '--project-dir', str(base), '--action', 'resume',
+               '--database', str(dbpath), '--', sys.executable, '-c', 'pass']
+    subprocess.run(command, check=True)
+    with sqlite3.connect(dbpath) as db:
+        assert db.execute('SELECT status FROM projects WHERE id=?',(pid,)).fetchone()[0] == 'incomplete'
+    (base/'tiktok'/'production-state.json').write_text(json.dumps({'status':'complete'}))
+    subprocess.run(command, check=True)
+    with sqlite3.connect(dbpath) as db:
+        assert db.execute('SELECT status FROM projects WHERE id=?',(pid,)).fetchone()[0] == 'completed'

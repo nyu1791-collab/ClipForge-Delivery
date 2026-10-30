@@ -326,7 +326,7 @@ def create_app(test_config=None):
             else:
                 kwargs['start_new_session'] = True
             subprocess.Popen([sys.executable, str(ROOT / 'controller.py'), '--project-dir', str(base),
-                              '--action', action, '--', *map(str, command)], **kwargs)
+                              '--action', action, '--database', str(database), '--', *map(str, command)], **kwargs)
 
     @app.post('/projects/<pid>/start')
     def start(pid):
@@ -346,9 +346,10 @@ def create_app(test_config=None):
         try:
             launch(base, 'start', [python, script, row['source_url'], '--mode', row['mode'], '--output', base, '--clips', row['clips']])
             with connect() as db:
-                db.execute("UPDATE projects SET status='started',updated_at=? WHERE id=?", (time.time(), pid))
-                event(db, pid, '制作コントローラー起動')
-            flash('制作を開始しました。実行状態は下の記録を確認してください。')
+                changed = db.execute("UPDATE projects SET status='started',updated_at=? WHERE id=? AND status='starting'", (time.time(), pid)).rowcount
+                if changed:
+                    event(db, pid, '制作コントローラー起動')
+            flash('制作を指示しました。実行状態は下の記録に表示します。')
         except OSError:
             with connect() as db:
                 db.execute("UPDATE projects SET status='start_failed',updated_at=? WHERE id=?", (time.time(), pid))
