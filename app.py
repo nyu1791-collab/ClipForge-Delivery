@@ -63,7 +63,10 @@ def create_app(test_config=None):
           delivery_url TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL,
           updated_at REAL NOT NULL);
           CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY, project_id TEXT NOT NULL,
-          event TEXT NOT NULL, created_at REAL NOT NULL);''')
+          event TEXT NOT NULL, created_at REAL NOT NULL);
+          CREATE TABLE IF NOT EXISTS clip_titles (project_id TEXT NOT NULL,
+          relative TEXT NOT NULL, title TEXT NOT NULL,
+          PRIMARY KEY (project_id, relative));''')
 
     def project(pid):
         if not re_id(pid):
@@ -76,6 +79,14 @@ def create_app(test_config=None):
 
     def event(db, pid, value):
         db.execute('INSERT INTO history(project_id,event,created_at) VALUES (?,?,?)', (pid, value, time.time()))
+
+    def project_assets(pid):
+        found = assets(data / 'productions' / pid)
+        with connect() as db:
+            titles = dict(db.execute('SELECT relative,title FROM clip_titles WHERE project_id=?', (pid,)).fetchall())
+        for item in found:
+            item['title'] = titles.get(item['relative'], item['title'])
+        return found
 
     @app.before_request
     def protect():
@@ -143,7 +154,32 @@ def create_app(test_config=None):
                     states.append({'name': name, 'status': '記録を読み取れません'})
         with connect() as db:
             history = [dict(r) for r in db.execute('SELECT event,created_at FROM history WHERE project_id=? ORDER BY id DESC LIMIT 20', (pid,))]
-        return render_template('detail.html', p=row, states=states, files=assets(base), history=history)
+        return render_template('detail.html', p=row, states=states, files=project_assets(pid), history=history)
+
+    @app.post('/projects/<pid>/clip-title')
+    def clip_title(pid):
+        project(pid)
+        relative = request.form.get('relative', '')
+        title = request.form.get('title', '').strip()
+        if not title or len(title) > 200 or relative not in {f['relative'] for f in project_assets(pid)}:
+            flash('動画とタイトルを確認してください。')
+            return redirect(url_for('detail', pid=pid))
+        with connect() as db:
+            db.execute('INSERT INTO clip_titles(project_id,relative,title) VALUES (?,?,?) ON CONFLICT(project_id,relative) DO UPDATE SET title=excluded.title', (pid, relative, title))
+            event(db, pid, '動画タイトルを更新')
+        flash('タイトルを保存しました。ZIPのタイトル一覧にも反映されます。')
+        return redirect(url_for('detail', pid=pid))
+
+    @app.get('/projects/<pid>/files/<path:relative>/<name>')
+    def clip_file(pid, relative, name):
+        project(pid)
+        if name not in ('video.mp4', 'captions.srt', 'captions.ass') or relative not in {f['relative'] for f in project_assets(pid)}:
+            abort(404)
+        base = data / 'productions' / pid
+        path = base / relative / name
+        if not path.is_file() or path.is_symlink() or not path.resolve().is_relative_to(base.resolve()):
+            abort(404)
+        return send_file(path, as_attachment=name != 'video.mp4', conditional=True)
 
     @app.post('/projects/<pid>/start')
     def start(pid):
@@ -266,7 +302,7 @@ def create_app(test_config=None):
     def download(pid):
         row = project(pid)
         base = data / 'productions' / pid
-        files = assets(base)
+        files = project_assets(pid)
         if not files:
             flash('回収済みの動画・字幕がまだありません。')
             return redirect(url_for('detail', pid=pid))
@@ -314,7 +350,10 @@ def assets(base):
             except (OSError, ValueError, TypeError, AttributeError):
                 continue
             if (folder / 'video.mp4').is_file() and not (folder / 'video.mp4').is_symlink():
-                result.append({'relative': folder.relative_to(base).as_posix(), 'title': title, 'mode': mode})
+                subtitles = [name for name in ('captions.srt', 'captions.ass')
+                             if (folder / name).is_file() and not (folder / name).is_symlink()]
+                result.append({'relative': folder.relative_to(base).as_posix(), 'title': title,
+                               'mode': mode, 'subtitles': subtitles})
     return result
 
 

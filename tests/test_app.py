@@ -93,3 +93,27 @@ def test_import_existing_clip_preserves_source(client, tmp_path):
     with zipfile.ZipFile(io.BytesIO(client.get(f'/projects/{pid}/download').data)) as bundle:
         assert any(name.endswith('video.mp4') for name in bundle.namelist())
         assert json.loads(bundle.read('titles.json'))['clips'][0]['title'] == '完成動画'
+
+
+def test_clip_preview_subtitle_and_title_edit(client, tmp_path):
+    response = create(client)
+    pid = response.location.rsplit('/', 1)[-1]
+    clip = tmp_path / 'data' / 'productions' / pid / 'long' / 'clips' / 'clips' / 'clip-001'
+    clip.mkdir(parents=True)
+    (clip / 'video.mp4').write_bytes(b'video content')
+    (clip / 'captions.srt').write_text('字幕', encoding='utf-8')
+    (clip / 'render.json').write_text(json.dumps({'selection': {'title': '元のタイトル'}}), encoding='utf-8')
+    relative = 'long/clips/clips/clip-001'
+    page = client.get(response.location).get_data(as_text=True)
+    assert '元のタイトル' in page and 'captions.srt を保存' in page
+    video = client.get(f'/projects/{pid}/files/{relative}/video.mp4', headers={'Range': 'bytes=0-4'})
+    assert video.status_code == 206 and video.data == b'video'
+    assert client.get(f'/projects/{pid}/files/{relative}/captions.srt').status_code == 200
+    assert client.get(f'/projects/{pid}/files/{relative}/render.json').status_code == 404
+    client.post(f'/projects/{pid}/clip-title', data={'csrf': token(client), 'relative': relative, 'title': '納品タイトル'})
+    assert '納品タイトル' in client.get(response.location).get_data(as_text=True)
+    with zipfile.ZipFile(io.BytesIO(client.get(f'/projects/{pid}/download').data)) as bundle:
+        assert json.loads(bundle.read('titles.json'))['clips'][0]['title'] == '納品タイトル'
+    assert json.loads((clip / 'render.json').read_text())['selection']['title'] == '元のタイトル'
+    client.post(f'/projects/{pid}/clip-title', data={'csrf': token(client), 'relative': '../other', 'title': '不正'})
+    assert client.get(f'/projects/{pid}/files/../other/video.mp4').status_code == 404
