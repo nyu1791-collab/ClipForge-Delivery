@@ -6,10 +6,7 @@ from datetime import datetime, date
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 import secrets
-import shutil
 import sqlite3
-import subprocess
-import sys
 import tempfile
 import time
 import uuid
@@ -17,6 +14,8 @@ import zipfile
 from urllib.parse import urlsplit, parse_qsl
 
 from flask import Flask, abort, flash, redirect, render_template, request, send_file, session, url_for
+from filelock import Timeout
+from imports import import_many, read_manifest
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DATA = Path.home() / '.clipforge-delivery'
@@ -27,8 +26,6 @@ DELIVERY = {'pending': '未納品', 'ready': '納品準備完了', 'delivered': 
 def create_app(test_config=None):
     app = Flask(__name__)
     app.config.update(DATA_DIR=os.environ.get('CLIPFORGE_DELIVERY_DATA', str(DEFAULT_DATA)),
-                      CLIPFORGE_DIR=os.environ.get('CLIPFORGE_DIR', str(ROOT.parent / 'ClipForge')),
-                      CLIPFORGE_PYTHON=os.environ.get('CLIPFORGE_PYTHON', ''),
                       MAX_CONTENT_LENGTH=1024 * 1024)
     if test_config:
         app.config.update(test_config)
@@ -148,8 +145,8 @@ def create_app(test_config=None):
             valid_url = parsed.scheme == 'https' and bool(host) and not parsed.username and not parsed.password and (not parsed.query or youtube_query) and not parsed.fragment
         except ValueError:
             valid_url = False
-        if not creator or not title or len(creator) > 100 or len(title) > 200 or len(source) > 2000 or not valid_url or mode not in MODES or not 1 <= count <= 10:
-            flash('配信者・案件名・公開HTTPS URL・本数（1〜10）を確認してください。')
+        if not creator or not title or len(creator) > 100 or len(title) > 200 or len(source) > 2000 or (source and not valid_url) or mode not in MODES or count < 1:
+            flash('配信者・案件名・公開HTTPS URL・目標本数（1以上）を確認してください。')
             return redirect(url_for('index'))
         pid, now = uuid.uuid4().hex, time.time()
         with connect() as db:
@@ -179,13 +176,43 @@ def create_app(test_config=None):
         with connect() as db:
             history = [dict(r) for r in db.execute('SELECT event,created_at FROM history WHERE project_id=? ORDER BY id DESC LIMIT 20', (pid,))]
             expenses = [dict(r) for r in db.execute('SELECT * FROM expenses WHERE project_id=? ORDER BY id DESC', (pid,))]
+        source_link = None
+        try:
+            linked = base / 'source-link.json'
+            if linked.is_file():
+                source_link = json.loads(linked.read_text(encoding='utf-8'))
+                manifest = Path(source_link['manifest'])
+                for parent in (manifest.parent, manifest.parent.parent):
+                    saved = parent / 'production-state.json'
+                    if saved.is_file():
+                        upstream = json.loads(saved.read_text(encoding='utf-8'))
+                        source_link['status'] = upstream.get('status', '不明')
+                        source_link['run_id'] = upstream.get('render_run_id')
+                        break
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            source_link = None
         controller_status = None
         try:
             status_path = base / 'controller-status.json'
             if status_path.is_file() and not status_path.is_symlink():
                 controller_status = json.loads(status_path.read_text(encoding='utf-8'))
                 if not isinstance(controller_status, dict):
-                    controller_status = None
+                    source_link = None
+        try:
+            linked = base / 'source-link.json'
+            if linked.is_file():
+                source_link = json.loads(linked.read_text(encoding='utf-8'))
+                manifest = Path(source_link['manifest'])
+                for parent in (manifest.parent, manifest.parent.parent):
+                    saved = parent / 'production-state.json'
+                    if saved.is_file():
+                        upstream = json.loads(saved.read_text(encoding='utf-8'))
+                        source_link['status'] = upstream.get('status', '不明')
+                        source_link['run_id'] = upstream.get('render_run_id')
+                        break
+        except (OSError, ValueError, KeyError, TypeError):
+            source_link = None
+        controller_status = None
         except (OSError, ValueError):
             pass
         totals = {}
@@ -203,7 +230,7 @@ def create_app(test_config=None):
                     item['subtitle_editor'] = edits[item['relative']] if item['subtitle_edited'] else path.read_text(encoding='utf-8-sig')
             except (OSError, UnicodeError):
                 pass
-        return render_template('detail.html', p=row, states=states, files=files, history=history, expenses=expenses, totals=totals, controller_status=controller_status)
+        return render_template('detail.html', p=row, states=states, files=files, history=history, expenses=expenses, totals=totals, controller_status=controller_status, source_link=source_link)
 
     @app.post('/projects/<pid>/edit')
     def edit_project(pid):
@@ -310,53 +337,6 @@ def create_app(test_config=None):
             abort(404)
         return send_file(path, as_attachment=name != 'video.mp4', conditional=True)
 
-    def production_tools(name):
-        root = Path(app.config['CLIPFORGE_DIR']).expanduser().resolve()
-        configured = app.config['CLIPFORGE_PYTHON']
-        python = Path(configured).expanduser().resolve() if configured else root / '.venv' / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
-        return root, root / 'tools' / name, python
-
-    def launch(base, action, command):
-        with (base / 'controller.log').open('ab') as log:
-            kwargs = {'cwd': str(Path(app.config['CLIPFORGE_DIR']).expanduser().resolve()),
-                      'stdin': subprocess.DEVNULL, 'stdout': log, 'stderr': subprocess.STDOUT,
-                      'env': {**os.environ, 'PYTHONUTF8': '1'}}
-            if os.name == 'nt':
-                kwargs['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP
-            else:
-                kwargs['start_new_session'] = True
-            subprocess.Popen([sys.executable, str(ROOT / 'controller.py'), '--project-dir', str(base),
-                              '--action', action, '--database', str(database), '--', *map(str, command)], **kwargs)
-
-    @app.post('/projects/<pid>/start')
-    def start(pid):
-        row = project(pid)
-        clipforge, script, python = production_tools('produce_formats.py')
-        if not script.is_file() or not python.is_file() or not shutil_which('gh'):
-            flash('ClipForge、仮想環境、またはGitHub CLIが見つかりません。設定手順を確認してください。')
-            return redirect(url_for('detail', pid=pid))
-        base = data / 'productions' / pid
-        base.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with connect() as db:
-            changed = db.execute("UPDATE projects SET status='starting',updated_at=? WHERE id=? AND status IN ('draft','start_failed')", (time.time(), pid)).rowcount
-            if not changed:
-                flash('この案件は既に開始済みです。重複投入はしません。')
-                return redirect(url_for('detail', pid=pid))
-            event(db, pid, '制作開始を指示')
-        try:
-            launch(base, 'start', [python, script, row['source_url'], '--mode', row['mode'], '--output', base, '--clips', row['clips']])
-            with connect() as db:
-                changed = db.execute("UPDATE projects SET status='started',updated_at=? WHERE id=? AND status='starting'", (time.time(), pid)).rowcount
-                if changed:
-                    event(db, pid, '制作コントローラー起動')
-            flash('制作を指示しました。実行状態は下の記録に表示します。')
-        except OSError:
-            with connect() as db:
-                db.execute("UPDATE projects SET status='start_failed',updated_at=? WHERE id=?", (time.time(), pid))
-                event(db, pid, 'コントローラーを起動できませんでした')
-            flash('起動に失敗しました。状態を確認してください。')
-        return redirect(url_for('detail', pid=pid))
-
     @app.post('/projects/<pid>/delivery')
     def update_delivery(pid):
         project(pid)
@@ -372,65 +352,49 @@ def create_app(test_config=None):
         flash('納品情報を保存しました。')
         return redirect(url_for('detail', pid=pid))
 
-    @app.post('/projects/<pid>/resume')
-    def resume(pid):
-        project(pid)
-        mode = request.form.get('mode', '')
-        if mode not in ('long', 'tiktok', 'tiktok-capcut'):
-            abort(400)
-        base = data / 'productions' / pid
-        output = base / mode
-        state = output / 'production-state.json'
-        clipforge, script, python = production_tools('produce_with_gemini.py')
-        if not state.is_file() or state.is_symlink() or not output.resolve().is_relative_to(base.resolve()) or not script.is_file() or not python.is_file():
-            flash('再接続に必要な保存済み状態またはClipForgeが見つかりません。')
-            return redirect(url_for('detail', pid=pid))
+    def import_entries(pid, entries):
         try:
-            launch(base, 'resume', [python, script, '--resume', '--output', output])
-            with connect() as db:
-                event(db, pid, mode + ' の保存済みRunに再接続')
-            flash('保存済みRunへの再接続を指示しました。処理中のコントローラーがある場合、重複起動は行いません。')
-        except OSError:
-            flash('再接続の起動に失敗しました。')
+            results = import_many(entries, data / 'productions' / pid)
+        except Timeout:
+            flash('この案件の素材を取り込み中です。完了後に一覧へ表示します。')
+            return redirect(url_for('detail', pid=pid))
+        copied = sum(r['status'] == 'imported' for r in results)
+        reused = sum(r['status'] in ('reused','updated') for r in results)
+        updated = sum(r['status'] == 'updated' for r in results)
+        failed = [r['message'] for r in results if r['status'] == 'failed']
+        with connect() as db:
+            if copied or reused:
+                db.execute("UPDATE projects SET status='received',updated_at=? WHERE id=?", (time.time(),pid))
+            for item in results:
+                if item.get('title') and item['status'] in ('imported','reused','updated'):
+                    relative = Path(item['directory']).relative_to(data/'productions'/pid).as_posix()
+                    db.execute('INSERT OR IGNORE INTO clip_titles(project_id,relative,title) VALUES (?,?,?)',
+                               (pid,relative,str(item['title'])[:200]))
+            event(db, pid, f'動画取込: 新規{copied}本・既存{reused}本・未取込{len(failed)}本')
+        flash(f'新規{copied}本を取り込み、既存{reused}本を再利用しました。字幕などの更新は{updated}本です。')
+        if failed:
+            flash('未取込: ' + ' / '.join(failed))
         return redirect(url_for('detail', pid=pid))
 
     @app.post('/projects/<pid>/import')
     def import_clip(pid):
         project(pid)
-        mode = request.form.get('mode', '')
-        if mode not in ('long', 'tiktok', 'tiktok-capcut'):
-            abort(400)
-        raw_source = request.form.get('clip_dir', '').strip()
-        if not raw_source:
-            flash('動画フォルダを指定してください。')
-            return redirect(url_for('detail', pid=pid))
-        source = Path(raw_source).expanduser()
-        if not source.is_dir() or source.is_symlink():
-            flash('動画フォルダを確認してください。')
-            return redirect(url_for('detail', pid=pid))
-        files = [source / name for name in ('video.mp4', 'captions.srt', 'captions.ass', 'render.json')]
-        if not files[0].is_file() or files[0].is_symlink() or any(p.is_symlink() for p in files):
-            flash('video.mp4が見つからないか、リンクが含まれています。')
-            return redirect(url_for('detail', pid=pid))
-        root = data / 'productions' / pid / mode / 'clips' / 'clips'
-        root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        target = root / ('clip-import-' + uuid.uuid4().hex[:12])
-        target.mkdir(mode=0o700)
+        return import_entries(pid, [{'directory':request.form.get('clip_dir', '').strip(),
+                                     'mode':request.form.get('mode', ''),
+                                     'title':request.form.get('clip_title', '').strip()[:200]}])
+
+    @app.post('/projects/<pid>/import-manifest')
+    def import_manifest(pid):
+        project(pid)
         try:
-            for file in files:
-                if file.is_file():
-                    shutil.copyfile(file, target / file.name)
-            if not (target / 'render.json').exists():
-                title = request.form.get('clip_title', '').strip()[:200] or source.name
-                (target / 'render.json').write_text(json.dumps({'selection': {'title': title}}, ensure_ascii=False), encoding='utf-8')
-        except OSError:
-            shutil.rmtree(target)
-            flash('動画を取り込めませんでした。')
+            entries = read_manifest(request.form.get('manifest_path', ''), request.form.get('mode', 'tiktok'))
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            flash('素材一覧を読み込めませんでした: ' + str(error))
             return redirect(url_for('detail', pid=pid))
-        with connect() as db:
-            event(db, pid, '既存の完成動画をコピー')
-        flash('既存動画を案件へコピーしました。元ファイルはそのままです。')
-        return redirect(url_for('detail', pid=pid))
+        base = data / 'productions' / pid
+        base.mkdir(parents=True, exist_ok=True)
+        (base / 'source-link.json').write_text(json.dumps({'manifest':str(Path(request.form['manifest_path']).expanduser().resolve())},ensure_ascii=False),encoding='utf-8')
+        return import_entries(pid, entries)
 
     @app.route('/projects/<pid>/download', methods=['GET', 'POST'])
     def download(pid):
@@ -457,6 +421,11 @@ def create_app(test_config=None):
                 if item['relative'] in edits:
                     bundle.writestr(item['relative'] + '/captions-edited.srt', edits[item['relative']])
             bundle.writestr('titles.json', json.dumps({'project': row['title'], 'clips': [{'file': i['relative'], 'title': i['title']} for i in files]}, ensure_ascii=False, indent=2))
+            note = [row['title'], '配信者: ' + row['creator'], f'動画: {len(files)}本', '']
+            for number, item in enumerate(files, 1):
+                note.extend([f"{number}. {item['title']}", '保存先: ' + item['relative'], ''])
+            note.append('captions-edited.srt は手修正した字幕です。動画に焼き込まれた字幕・元SRT・ASSは別に保持しています。')
+            bundle.writestr('納品内容.txt', '\n'.join(note))
         tmp.seek(0)
         return send_file(tmp, mimetype='application/zip', as_attachment=True, download_name='clipforge-delivery-' + pid[:8] + '.zip')
 
@@ -465,11 +434,6 @@ def create_app(test_config=None):
 
 def re_id(value):
     return len(value) == 32 and all(c in '0123456789abcdef' for c in value)
-
-
-def shutil_which(name):
-    import shutil
-    return shutil.which(name)
 
 
 def assets(base):

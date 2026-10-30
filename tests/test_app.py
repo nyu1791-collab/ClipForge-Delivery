@@ -1,11 +1,6 @@
 import io
 import json
-from pathlib import Path
 import re
-import subprocess
-import sqlite3
-import sys
-import time
 import zipfile
 
 import pytest
@@ -60,28 +55,8 @@ def test_export_only_project_files_and_title(client, tmp_path):
     response = client.get(f'/projects/{pid}/download')
     assert response.status_code == 200
     with zipfile.ZipFile(io.BytesIO(response.data)) as bundle:
-        assert sorted(bundle.namelist()) == ['tiktok/clips/clips/clip-001/captions.srt', 'tiktok/clips/clips/clip-001/video.mp4', 'titles.json']
+        assert sorted(bundle.namelist()) == ['tiktok/clips/clips/clip-001/captions.srt', 'tiktok/clips/clips/clip-001/video.mp4', 'titles.json', '納品内容.txt']
         assert json.loads(bundle.read('titles.json'))['clips'][0]['title'] == '見出し'
-
-
-def test_start_does_not_repeat_dispatch(client, tmp_path, monkeypatch):
-    import app as module
-    response = create(client)
-    pid = response.location.rsplit('/', 1)[-1]
-    root = tmp_path / 'clipforge'
-    (root / 'tools').mkdir(parents=True)
-    (root / 'tools' / 'produce_formats.py').write_text('')
-    (root / '.venv' / 'bin').mkdir(parents=True)
-    (root / '.venv' / 'bin' / 'python').write_text('')
-    calls = []
-    monkeypatch.setattr(module, 'shutil_which', lambda _: '/usr/bin/gh')
-    monkeypatch.setattr(module.subprocess, 'Popen', lambda argv, **kw: calls.append((argv, kw)))
-    csrf = token(client)
-    client.post(f'/projects/{pid}/start', data={'csrf': csrf})
-    client.post(f'/projects/{pid}/start', data={'csrf': csrf})
-    assert len(calls) == 1
-    assert '--mode' in calls[0][0] and 'both' in calls[0][0]
-    assert not calls[0][1].get('shell', False)
 
 
 def test_import_existing_clip_preserves_source(client, tmp_path):
@@ -165,42 +140,3 @@ def test_selected_delivery_and_subtitle_edits(client, tmp_path):
     assert (base / 'clip-001' / 'captions.srt').read_text() == '元の字幕'
 
 
-def test_controller_prevents_concurrent_reconnect(tmp_path):
-    controller = Path(__file__).resolve().parents[1] / 'controller.py'
-    command = [sys.executable, str(controller), '--project-dir', str(tmp_path), '--action', 'resume', '--', sys.executable, '-c', 'import time; time.sleep(1)']
-    first = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    try:
-        deadline = time.monotonic() + 5
-        while not (tmp_path / 'controller-status.json').exists() and time.monotonic() < deadline:
-            time.sleep(0.02)
-        assert (tmp_path / 'controller-status.json').exists()
-        second = subprocess.run(command, capture_output=True, timeout=5)
-        assert second.returncode == 2
-        assert first.wait(timeout=5) == 0
-        status = json.loads((tmp_path / 'controller-status.json').read_text())
-        assert status['status'] == 'finished' and status['exit_code'] == 0
-    finally:
-        if first.poll() is None:
-            first.kill()
-            first.wait()
-
-
-def test_controller_updates_whole_project_after_one_format_finishes(client, tmp_path):
-    response = create(client)
-    pid = response.location.rsplit('/', 1)[-1]
-    base = tmp_path / 'data' / 'productions' / pid
-    for mode, status in [('long', 'complete'), ('tiktok', 'failed_or_unknown')]:
-        folder = base / mode
-        folder.mkdir(parents=True)
-        (folder/'production-state.json').write_text(json.dumps({'status':status}))
-    dbpath = tmp_path / 'data' / 'delivery.sqlite3'
-    controller = Path(__file__).resolve().parents[1] / 'controller.py'
-    command = [sys.executable, str(controller), '--project-dir', str(base), '--action', 'resume',
-               '--database', str(dbpath), '--', sys.executable, '-c', 'pass']
-    subprocess.run(command, check=True)
-    with sqlite3.connect(dbpath) as db:
-        assert db.execute('SELECT status FROM projects WHERE id=?',(pid,)).fetchone()[0] == 'incomplete'
-    (base/'tiktok'/'production-state.json').write_text(json.dumps({'status':'complete'}))
-    subprocess.run(command, check=True)
-    with sqlite3.connect(dbpath) as db:
-        assert db.execute('SELECT status FROM projects WHERE id=?',(pid,)).fetchone()[0] == 'completed'
