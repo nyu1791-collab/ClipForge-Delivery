@@ -1,0 +1,30 @@
+{
+  "schema": 1,
+  "name": "ClipForge-Delivery",
+  "kind": "delivery",
+  "setup": [
+    [
+      "{bootstrap_python}",
+      "-m",
+      "venv",
+      "{repo}/.venv"
+    ],
+    [
+      "{python}",
+      "-m",
+      "pip",
+      "install",
+      "-r",
+      "requirements.txt"
+    ]
+  ],
+  "tools": [
+    "git"
+  ],
+  "credential_names": [],
+  "native_entry": "python app.py",
+  "package_mode": "long",
+  "production_execution": "explicit_native_command",
+  "shared_runtime": false,
+  "recommended_python": "3.12"
+}

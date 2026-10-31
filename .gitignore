@@ -4,3 +4,10 @@ __pycache__/
 *.pyc
 *.sqlite3
 .env
+
+# PC-local optional automation state
+.venv-research/
+workstation/local.json
+workstation/*.local.json
+
+.ruff_cache/
