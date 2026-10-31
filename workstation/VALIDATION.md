@@ -13,3 +13,5 @@
 GitHubの公開ページとGit checkoutで8つの外部候補の機能・LICENSEを確認した。GitHub APIホストはクラウドのネットワークで拒否され、Desktop Commanderのツールもこのセッションにはない。公開プロフィールで見えた9リポジトリを対象にし、非公開全件列挙は未確認。
 
 以前の公開保存庫移管の未コミット変更はgit stashと `/workspace/private/pre-pc-integration-2026-10-31` の控えに保持した。この作業で適用・削除・公開はしていない。
+
+PC起動確認で既存のapp.pyに重複したtryブロックによるSyntaxErrorを発見したため、重複部分を除去し、controller-statusが不正な場合も取込元情報を保持するよう修正。既存アプリのテストと追加した相対パック取り込みテストは合計10件成功（0.37秒）。新しい仮想環境のFlask/Waitressで、独立データフォルダの実HTTP 200を確認し、確認サーバーを停止した。

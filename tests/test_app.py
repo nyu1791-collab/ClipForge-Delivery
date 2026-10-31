@@ -43,6 +43,21 @@ def test_url_validation_including_youtube(client):
     assert '確認してください' in client.get('/').get_data(as_text=True)
 
 
+@pytest.mark.parametrize('controller_text', ['[]', '{invalid json'])
+def test_invalid_optional_controller_status_keeps_import_source(client, tmp_path, controller_text):
+    response = create(client)
+    pid = response.location.rsplit('/', 1)[-1]
+    base = tmp_path / 'data' / 'productions' / pid
+    base.mkdir(parents=True, exist_ok=True)
+    manifest = tmp_path / 'original' / 'manifest.json'
+    (base / 'source-link.json').write_text(json.dumps({'manifest': str(manifest)}), encoding='utf-8')
+    (base / 'controller-status.json').write_text(controller_text, encoding='utf-8')
+    detail = client.get(response.location)
+    assert detail.status_code == 200
+    assert '取込元の保存記録' in detail.get_data(as_text=True)
+    assert str(manifest) in detail.get_data(as_text=True)
+
+
 def test_export_only_project_files_and_title(client, tmp_path):
     response = create(client)
     pid = response.location.rsplit('/', 1)[-1]
