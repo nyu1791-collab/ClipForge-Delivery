@@ -197,24 +197,9 @@ def create_app(test_config=None):
             if status_path.is_file() and not status_path.is_symlink():
                 controller_status = json.loads(status_path.read_text(encoding='utf-8'))
                 if not isinstance(controller_status, dict):
-                    source_link = None
-        try:
-            linked = base / 'source-link.json'
-            if linked.is_file():
-                source_link = json.loads(linked.read_text(encoding='utf-8'))
-                manifest = Path(source_link['manifest'])
-                for parent in (manifest.parent, manifest.parent.parent):
-                    saved = parent / 'production-state.json'
-                    if saved.is_file():
-                        upstream = json.loads(saved.read_text(encoding='utf-8'))
-                        source_link['status'] = upstream.get('status', '不明')
-                        source_link['run_id'] = upstream.get('render_run_id')
-                        break
-        except (OSError, ValueError, KeyError, TypeError):
-            source_link = None
-        controller_status = None
+                    controller_status = None
         except (OSError, ValueError):
-            pass
+            controller_status = None
         totals = {}
         for expense in expenses:
             totals[expense['currency']] = totals.get(expense['currency'], Decimal('0')) + Decimal(expense['amount'])
