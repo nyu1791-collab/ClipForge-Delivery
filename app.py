@@ -450,5 +450,6 @@ def assets(base):
 
 if __name__ == '__main__':
     from waitress import serve
-    print('ClipForge Delivery: http://127.0.0.1:8765', flush=True)
-    serve(create_app(), host='127.0.0.1', port=8765, threads=4)
+    port = int(os.environ.get('CLIPFORGE_DELIVERY_PORT', '8765'))
+    print(f'ClipForge Delivery: http://127.0.0.1:{port}', flush=True)
+    serve(create_app(), host='127.0.0.1', port=port, threads=4)
